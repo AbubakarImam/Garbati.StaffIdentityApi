@@ -43,29 +43,49 @@ StaffIdentityApi answers exactly one question, for exactly one caller: **"who is
 | `Role` | One of the fixed set in 2.2. Single value (owner's decision, 1.2). |
 | `Status` | `Active` / `Suspended` / `Terminated`. `Terminated` is permanent — no path back to `Active`, mirroring `IdentityApi`'s `Closed`/`Deceased` being terminal (its decision #9). `Suspended` can be reactivated to `Active`. |
 | `MustChangePassword` | Boolean. Set `true` whenever an administrator sets/resets someone else's password; cleared once the staff member changes it themselves on next login. Standard practice: an admin-set password is never meant to be the permanent one. |
-| `CreatedAt`, `CreatedByStaffId` | `CreatedByStaffId` nullable — null only for the very first seeded administrator account (2.4). |
+| `SupervisorStaffId` | Nullable, self-referencing (`StaffId` of another `StaffUser`). Owner's decision, 19 Oct 2026 — see decision #4. |
+| `CreatedAt`, `CreatedByStaffId` | `CreatedByStaffId` nullable — null only for the very first seeded administrator account (2.5). |
 | `UpdatedAt` | |
 
-### 2.2 `Role` (fixed enum for v1, from T-026 Q2)
+### 2.2 `Role` (fixed enum for v1, from T-026 Q2 — `CustomerServiceOfficer` added by owner, 19 Oct 2026)
 
-`Teller`, `Supervisor`, `ComplianceOfficer`, `RiskOfficer`, `Auditor`, `Administrator`.
+| Role | Primary responsibility (context only — `OpsApi` enforces the actual permission mapping, T-028) |
+|---|---|
+| `Teller` | Front-line transaction processing (fund/transfer initiation via the testing console). |
+| `CustomerServiceOfficer` | Customer detail updates — the "account detail updates" item in the ops console's v1 scope (`TASKS.md` D-13) belongs to this role. |
+| `Supervisor` | Approves overrides/exceptions; the "checker" in maker-checker for both `Teller` and `CustomerServiceOfficer` actions (decision #4 — the two roles share this supervisory relationship explicitly, not just by coincidence). |
+| `ComplianceOfficer` | KYC/AML review. |
+| `RiskOfficer` | Operations/risk review. |
+| `Auditor` | Independent, read-only review — never a maker or a checker for any action. |
+| `Administrator` | Staff and role management; system administration. Reserved for deployment/setup activity, not a default working account (mirrors Temenos's own convention, T-026 Q2). |
 
-This document does not define what each role may actually *do* in the ops console — that's `OpsApi`'s authorization logic (T-028), reading this service's `Role` value as its input. StaffIdentityApi's job stops at reporting the role.
+This document does not define what each role may actually *do* in the ops console beyond the context notes above — the actual permission mapping is `OpsApi`'s authorization logic (T-028), reading this service's `Role` value as its input. StaffIdentityApi's job stops at reporting the role (and, from decision #4 below, the supervisor).
 
 ### 2.3 Why a signed assertion (like IdentityApi's grant) is deliberately NOT used here
 
 `IdentityApi`'s authorization grant is a short-lived, signed token specifically because it has to travel **through an intermediary** (`OrchestratorApi`) and be verified **independently, by a different service** (`LedgerApi`) without a round trip back to `IdentityApi` (P-12's whole point: no added latency, no new dependency on the issuer being reachable at verification time).
 
-`StaffIdentityApi` → `OpsApi` has no such shape: `OpsApi` calls `StaffIdentityApi` directly, over a trusted backend-to-backend link, and is itself the only consumer of the answer — there is no third service that later needs to independently verify a token without calling back. Reusing the signed-grant pattern here would be copying a mechanism without the constraint that justifies it. **Decision #1:** `POST /v1/staff/authenticate` returns a plain, ordinary authenticated JSON response (2.4) — no JWT, no signing key, no new cryptographic machinery in this service at all. `OpsApi` is the one that mints the actual browser-facing session (an opaque, server-side session id in an `HttpOnly`/`Secure`/`SameSite` cookie, per `ARCHITECTURE.md` 3.1) — entirely `OpsApi`'s own concern, out of scope here.
+`StaffIdentityApi` → `OpsApi` has no such shape: `OpsApi` calls `StaffIdentityApi` directly, over a trusted backend-to-backend link, and is itself the only consumer of the answer — there is no third service that later needs to independently verify a token without calling back. Reusing the signed-grant pattern here would be copying a mechanism without the constraint that justifies it. **Decision #1:** `POST /v1/staff/authenticate` returns a plain, ordinary authenticated JSON response (Section 3) — no JWT, no signing key, no new cryptographic machinery in this service at all. `OpsApi` is the one that mints the actual browser-facing session (an opaque, server-side session id in an `HttpOnly`/`Secure`/`SameSite` cookie, per `ARCHITECTURE.md` 3.1) — entirely `OpsApi`'s own concern, out of scope here.
 
-### 2.4 `StaffAuditLog`
+### 2.4 Supervisory relationship (decision #4, owner, 19 Oct 2026)
+
+A real org chart, not just a flat role label: `StaffUser.SupervisorStaffId` names *which specific staff member* a given `Teller` or `CustomerServiceOfficer` reports to. The owner's own example — a `Teller` and a `CustomerServiceOfficer` sharing the same supervisor — is an organizational fact an `Administrator` configures per staff member, not a rule this service hardcodes; it is naturally expressed by assigning the same `SupervisorStaffId` to both.
+
+**Validation (enforced at assignment time, matching T-026 Q4's "SoD rules checked at assignment time, not just at action time"):**
+- `SupervisorStaffId` must reference an existing, `Active` `StaffUser` whose `Role` is `Supervisor`. An `Administrator` is a different functional role (system/staff administration, not line supervision) and is deliberately not accepted here — if that turns out to be too strict in practice, it's a cheap rule to relax later, and relaxing a validation rule is a much smaller change than discovering too late that "supervisor" silently meant two different things.
+- A staff member cannot be their own supervisor.
+- `Supervisor`, `ComplianceOfficer`, `RiskOfficer`, `Auditor`, and `Administrator` accounts have no `SupervisorStaffId` of their own in v1 (`null`) — only `Teller` and `CustomerServiceOfficer` are supervised line roles in this version. This is a deliberate simplification, not a claim that supervisors/compliance/risk/audit roles never report to anyone in reality; a fuller org chart (e.g. a `Supervisor` reporting to a branch manager) is out of scope until there's a real need for it.
+
+**What this does NOT do:** `SupervisorStaffId` is a fact StaffIdentityApi reports; it does not, by itself, make `OpsApi` enforce anything. Whether a `Teller`'s or `CustomerServiceOfficer`'s specific action actually requires their named supervisor's approval (versus any `Supervisor`) is `OpsApi`'s call (T-028) — flagged here as a concrete design question for that task, not decided by this document.
+
+### 2.5 `StaffAuditLog`
 
 Same append-only convention every GARBATI service follows (`ARCHITECTURE.md` Section 5): one row per sensitive action, written in the same database transaction as the change it describes.
 
 | Field | Notes |
 |---|---|
 | `Id` | |
-| `Action` | `StaffCreated`, `RoleChanged`, `StatusChanged`, `PasswordReset`, `AuthenticationSucceeded`, `AuthenticationFailed`. |
+| `Action` | `StaffCreated`, `RoleChanged`, `StatusChanged`, `SupervisorChanged`, `PasswordReset`, `AuthenticationSucceeded`, `AuthenticationFailed`. |
 | `TargetStaffId` | Whose account this is about. |
 | `ActingStaffId` | Who did it. Nullable **only** for `AuthenticationFailed` (the attempted username is recorded in `Details`, never the password) and for the very first seeded administrator's own `StaffCreated` row. |
 | `Details` | Free text — e.g. old role → new role, old status → new status. Never a password or password hash. |
@@ -79,12 +99,13 @@ All under `/v1/staff`, following `ARCHITECTURE.md` Section 5's shared convention
 
 | Endpoint | Scope required | Notes |
 |---|---|---|
-| `POST /v1/staff/authenticate` | `staffidentity.authenticate` | `{username, password}` → `200 {staffId, fullName, role}` on success, `401` (generic — no "wrong username" vs "wrong password" distinction, to avoid username enumeration) on failure. Every attempt is audited (2.4), success or failure. If `Status != Active`, authentication fails exactly like a wrong password (same generic `401`) — a suspended/terminated account gives no signal distinguishing it from a bad credential. |
+| `POST /v1/staff/authenticate` | `staffidentity.authenticate` | `{username, password}` → `200 {staffId, fullName, role}` on success, `401` (generic — no "wrong username" vs "wrong password" distinction, to avoid username enumeration) on failure. Every attempt is audited (2.5), success or failure. If `Status != Active`, authentication fails exactly like a wrong password (same generic `401`) — a suspended/terminated account gives no signal distinguishing it from a bad credential. |
 | `POST /v1/staff` | `staffidentity.admin` | Create a staff account. `{idempotencyKey, actingStaffId, fullName, username, role}` — no password in the request; a one-time temporary credential is generated server-side and returned once in the response (never stored in plain text, never logged), with `MustChangePassword = true`. Idempotency key required (`ARCHITECTURE.md` Section 5), same convention as every other create-something-new endpoint on this platform. |
-| `GET /v1/staff/{staffId}` | `staffidentity.admin` | Never returns `PasswordHash`. |
-| `GET /v1/staff` | `staffidentity.admin` | Paged list/search, for the staff & role management screen. |
-| `PATCH /v1/staff/{staffId}/role` | `staffidentity.admin` | `{actingStaffId, role}`. Audited. |
+| `GET /v1/staff/{staffId}` | `staffidentity.admin` | Never returns `PasswordHash`. Includes `supervisorStaffId`. |
+| `GET /v1/staff?supervisorStaffId=...` | `staffidentity.admin` | Paged list/search, for the staff & role management screen. The `supervisorStaffId` filter answers "who reports to this supervisor" — needed once `OpsApi` (T-028) decides whether a `Supervisor` should only see their own reports' pending approvals. |
+| `PATCH /v1/staff/{staffId}/role` | `staffidentity.admin` | `{actingStaffId, role}`. Audited. Changing a `Teller`/`CustomerServiceOfficer` to any other role does **not** automatically clear `SupervisorStaffId` — a separate `PATCH .../supervisor` call is required, so the two changes are always independently audited rather than one silently implying the other. |
 | `PATCH /v1/staff/{staffId}/status` | `staffidentity.admin` | `{actingStaffId, status}`. Audited. Rejects any transition out of `Terminated` (400). |
+| `PATCH /v1/staff/{staffId}/supervisor` | `staffidentity.admin` | `{actingStaffId, supervisorStaffId}` (nullable, to unassign). Audited. Rejects (400) unless `supervisorStaffId` is `null` or references an `Active` `Supervisor` (decision #4); rejects self-reference. |
 | `POST /v1/staff/{staffId}/password` | `staffidentity.admin` (admin-driven reset) or `staffidentity.authenticate` (self-service change, caller supplies their own current password) | Two distinct real-world actions sharing one endpoint shape, distinguished by which scope/credential the caller presents — mirrors how `IdentityApi`'s `AuthorizationController.RequestAuthorization` already branches one endpoint on caller scope (its own T-020 comment makes the same call). Admin-driven reset sets `MustChangePassword = true`; self-service change clears it. |
 
 **Decision #3 (two scopes, not one):** `staffidentity.authenticate` (login only) and `staffidentity.admin` (create/list/modify staff and roles) are kept separate, even though `OpsApi` is the only caller today and needs both. This limits blast radius if a future internal caller only ever needs to verify a login and should never be able to create or modify staff accounts — cheap to split now, costly to retrofit later. (Contrast with `OrchestratorApi`'s own judgment call to use a *single* scope per caller elsewhere in this platform, Appendix A item 3 of its design — that call was right for a service whose one caller has one coherent job; staff identity's "authenticate" and "administer" are genuinely different blast radii for the same caller.)
@@ -97,10 +118,11 @@ All under `/v1/staff`, following `ARCHITECTURE.md` Section 5's shared convention
 
 ## 5. What "done" looks like for the first build task
 
-A follow-up task (not this document) builds: the `StaffUser`/`StaffAuditLog` EF Core entities and migration (including the one-time Administrator seed, decision #2), the endpoints in Section 3, `ApiKeyAuthenticationHandler`-style scope enforcement (reusing the exact pattern already proven in `LedgerApi`/`IdentityApi`/`OrchestratorApi`, not inventing a new one), and a test suite covering: successful/failed authentication (including the generic-401 non-enumeration behavior), status transitions (including the `Terminated`-is-permanent rule), the two-scope split, and idempotent staff creation.
+A follow-up task (not this document) builds: the `StaffUser`/`StaffAuditLog` EF Core entities and migration (including the one-time Administrator seed, decision #2), the endpoints in Section 3, `ApiKeyAuthenticationHandler`-style scope enforcement (reusing the exact pattern already proven in `LedgerApi`/`IdentityApi`/`OrchestratorApi`, not inventing a new one), and a test suite covering: successful/failed authentication (including the generic-401 non-enumeration behavior), status transitions (including the `Terminated`-is-permanent rule), the two-scope split, idempotent staff creation, and the supervisor-assignment validation rules in decision #4 (must reference an `Active` `Supervisor`, no self-reference, independence from `PATCH .../role`).
 
 ## 6. Open questions (explicitly deferred, not silently skipped)
 
 1. Session/credential lifetime on the `OpsApi` side (how long a staff login session lasts before re-authentication is required) is `OpsApi`'s decision, not this service's — flagged here only so it isn't lost: T-028 needs to decide it.
 2. Whether `staffidentity.admin` should itself be split further (e.g. a narrower scope for "change status" vs "create new account") is a real question once a second privileged caller (if any) ever exists; not worth the complexity for a single caller today.
 3. CBN or any Nigeria-specific staff-access/authentication regulatory requirement — T-026 found none in general research; a compliance officer should confirm before this goes anywhere near real production use with real staff.
+4. Whether `OpsApi` should require a `Teller`'s/`CustomerServiceOfficer`'s *own named* supervisor to approve their actions, versus any `Supervisor` — decision #4 only establishes the fact (who supervises whom); T-028 decides what, if anything, that fact gates.
