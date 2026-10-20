@@ -78,6 +78,8 @@ A real org chart, not just a flat role label: `StaffUser.SupervisorStaffId` name
 
 **What this does NOT do:** `SupervisorStaffId` is a fact StaffIdentityApi reports; it does not, by itself, make `OpsApi` enforce anything. Whether a `Teller`'s or `CustomerServiceOfficer`'s specific action actually requires their named supervisor's approval (versus any `Supervisor`) is `OpsApi`'s call (T-028) — flagged here as a concrete design question for that task, not decided by this document.
 
+**Documented v1 limitation (`garbati-platform` D-17, decided by the owner 20 Oct 2026, found by T-032's QA review):** the validation above runs only when `SupervisorStaffId` itself is written (`PATCH /v1/staff/{staffId}/supervisor`) — it is **not** re-checked when the *referenced* staff member's own role later changes. If a `Supervisor` is reassigned to, say, `ComplianceOfficer`, every `Teller`/`CustomerServiceOfficer` who still has `SupervisorStaffId` pointing at them keeps pointing at someone no longer eligible — silently, with no flag, no block, and no automatic cleanup. This is a direct, accepted consequence of the "assignment-time-only" choice above (T-026 Q4), not an oversight discovered after the fact: the owner was asked explicitly, after QA surfaced it, whether to fix this now (block the role change while active reports exist, or cascade-clear them) and chose to leave it as a known v1 limitation instead, on the reasoning that the real exposure is low until real staff accounts and real traffic exist. Revisit if that stops being true.
+
 ### 2.5 `StaffAuditLog`
 
 Same append-only convention every GARBATI service follows (`ARCHITECTURE.md` Section 5): one row per sensitive action, written in the same database transaction as the change it describes.
@@ -126,6 +128,7 @@ A follow-up task (not this document) builds: the `StaffUser`/`StaffAuditLog` EF 
 2. Whether `staffidentity.admin` should itself be split further (e.g. a narrower scope for "change status" vs "create new account") is a real question once a second privileged caller (if any) ever exists; not worth the complexity for a single caller today.
 3. CBN or any Nigeria-specific staff-access/authentication regulatory requirement — T-026 found none in general research; a compliance officer should confirm before this goes anywhere near real production use with real staff.
 4. Whether `OpsApi` should require a `Teller`'s/`CustomerServiceOfficer`'s *own named* supervisor to approve their actions, versus any `Supervisor` — decision #4 only establishes the fact (who supervises whom); T-028 decides what, if anything, that fact gates.
+5. **Resolved, not deferred:** whether a Supervisor-reassignment should clean up orphaned reports pointing at them (D-17) — the owner decided to leave this as a documented limitation rather than fix it now. See 2.4's own note for the full reasoning; listed here only as a pointer so a reader scanning this section doesn't miss it.
 
 ## Appendix A. T-032 build notes (foundation: entities, all 8 endpoints, Administrator seed)
 
