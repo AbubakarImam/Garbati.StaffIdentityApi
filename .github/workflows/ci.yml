@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # "Run workflow" button: redeploy main without a new commit
+
+permissions:
+  contents: read
+
+# A new push to the same branch or PR cancels the run still in progress.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - run: dotnet restore
+      - run: dotnet build --no-restore -c Release
+
+      # Testcontainers starts Postgres in Docker, which GitHub's Ubuntu runners provide.
+      - run: dotnet test --no-build -c Release --logger trx --results-directory TestResults
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: TestResults
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: final
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build migrator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: migrator
+          push: false
+          cache-from: type=gha
+
+  # Placeholder deploy job (task file: "the owner wires up real deploy values separately, the same way
+  # IdentityApi's and OrchestratorApi's deploy jobs were initially placeholders later filled in"). Resource
+  # names below are NOT real infrastructure yet - this job will fail until the owner provisions an App
+  # Service/database and the AZUREAPPSERVICE_* secrets for this specific repo, the same bootstrapping every
+  # sibling service went through. Getting test/docker green on this branch is what this task's done means.
+  deploy:
+    needs: [test, docker]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # lets azure/login exchange GitHub's OIDC token: no Azure password is stored anywhere
+      contents: read
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false # never stop a deploy halfway
+    env:
+      RESOURCE_GROUP: ledger-rg # placeholder: shares LedgerApi's App Service Plan/Postgres server, same as OrchestratorApi
+      APP_NAME: garbati-staffidentityapi
+      DB_SERVER: ledgerapi-db-san # placeholder; StaffIdentityApi would get its own database on this shared server
+      APP_URL: https://garbati-staffidentityapi.azurewebsites.net
+      FIREWALL_RULE: github-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # Publish the API project only: publishing the solution also ships the test project.
+      - name: Publish the API
+        run: |
+          dotnet publish src/Garbati.StaffIdentityApi/Garbati.StaffIdentityApi.csproj -c Release -o publish
+          rm -f publish/appsettings.Development.json
+          (cd publish && zip -qr ../app.zip .)
+
+      - name: Build the migration bundle
+        run: |
+          dotnet tool restore
+          dotnet ef migrations bundle --project src/Garbati.StaffIdentityApi --configuration Release --output efbundle
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_STAFFIDENTITYAPI }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_STAFFIDENTITYAPI }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_STAFFIDENTITYAPI }}
+
+      # The App Service setting is the single source of truth: the connection string is not copied into GitHub.
+      - name: Read the connection string from App Service
+        run: |
+          cs=$(az webapp config connection-string list -g "$RESOURCE_GROUP" -n "$APP_NAME" --query "[?name=='StaffIdentityDb'].value | [0]" -o tsv)
+          if [ -z "$cs" ]; then echo "::error::App Service has no StaffIdentityDb connection string"; exit 1; fi
+          echo "::add-mask::$cs"
+          echo "STAFFIDENTITYDB=$cs" >> "$GITHUB_ENV"
+
+      - name: Allow this runner through the database firewall
+        run: |
+          ip=$(curl -fsS https://api.ipify.org)
+          az postgres flexible-server firewall-rule create -g "$RESOURCE_GROUP" --server-name "$DB_SERVER" \
+            --name "$FIREWALL_RULE" --start-ip-address "$ip" --end-ip-address "$ip" -o none
+
+      - name: Apply migrations
+        run: ./efbundle --connection "$STAFFIDENTITYDB"
+
+      # Runs even when an earlier step failed, so the runner's IP never stays allowed.
+      - name: Remove the runner's firewall rule
+        if: always()
+        run: |
+          az postgres flexible-server firewall-rule delete -g "$RESOURCE_GROUP" --server-name "$DB_SERVER" \
+            --name "$FIREWALL_RULE" --yes -o none || true
+
+      # --clean empties wwwroot first, so files from older deployments cannot linger.
+      - name: Deploy to App Service
+        run: az webapp deploy -g "$RESOURCE_GROUP" -n "$APP_NAME" --src-path app.zip --type zip --clean true
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 30); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/health/ready")" = "200" ] && break
+            sleep 10
+          done
+          ready=$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/health/ready")
+          unauthenticated=$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/v1/staff/STF-SMOKETEST")
+          echo "/health/ready: $ready, request without a key: $unauthenticated"
+          [ "$ready" = "200" ] || { echo "::error::/health/ready did not return 200"; exit 1; }
+          [ "$unauthenticated" = "401" ] || { echo "::error::the API did not reject a request without a key"; exit 1; }
