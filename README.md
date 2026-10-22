@@ -134,6 +134,8 @@ The response's `temporaryPassword` is shown once — note it down, then authenti
 
 Every request gets a correlation id (`X-Correlation-ID`). Audit rows (`staff_audit_logs`) are written in the same database transaction as the change they describe. No password, password hash or one-time temporary credential is ever logged.
 
+This is deliberately all GARBATI ships today — no metrics/tracing/alerting stack. See `garbati-platform`'s `OBSERVABILITY.md` for why, and what to reach for if you need more.
+
 ## Deployment
 
 The `Dockerfile` builds two images:
